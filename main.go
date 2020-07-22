@@ -18,51 +18,66 @@ import (
 )
 
 func main() {
-	log.SetPrefix("lock: ")
+	log.SetPrefix("Dynamodb Lock: ")
 	log.SetFlags(0)
 	app := cli.NewApp()
 	app.HideVersion = true
-	app.Name = "lock"
-	app.Usage = "lock and execute given command"
-	app.Flags = []cli.Flag{
-		cli.BoolFlag{Name: "release-on-error,r"},
-		cli.BoolFlag{Name: "wait-for-lock,w"},
-		cli.StringFlag{
-			Name:  "table",
-			Value: "locks",
+	app.Name = "Dynamodb Lock"
+	app.Usage = "Use dynamodb as a distributed log"
+	app.Commands = []cli.Command{
+		{
+			Name: "run-command",
+			Flags: []cli.Flag{
+				cli.StringFlag{
+					Name:     "table, t",
+					Required: true,
+				},
+				cli.StringFlag{
+					Name:     "lock-name,l",
+					Required: true,
+				},
+			},
+			Aliases: []string{"c"},
+			Usage:   "complete a task on the list",
+			Action: func(c *cli.Context) error {
+				lockName := c.String("lock-name")
+				if lockName == "" {
+					return xerrors.New("missing lock name")
+				}
+				tableName := c.String("table")
+				if tableName == "" {
+					return xerrors.New("missing lock name")
+				}
+
+				cmd := c.Args()
+				if len(cmd) == 0 {
+					return xerrors.New("missing arg: cmd")
+				}
+
+				client, err := dialDynamoDB(tableName)
+				if err != nil {
+					return err
+				}
+				if err := createTable(client, tableName); err != nil {
+					return err
+				}
+				lock, err := grabLock(client, lockName, true)
+				if err != nil {
+					return err
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				trap := make(chan os.Signal, 1)
+				signal.Notify(trap, os.Interrupt)
+				go func() {
+					<-trap
+					cancel()
+				}()
+				return runCommand(ctx, lock, true, cmd)
+			},
 		},
 	}
-	app.Action = func(c *cli.Context) error {
-		lockName := c.Args().First()
-		if lockName == "" {
-			return xerrors.New("missing lock name")
-		}
-		cmd := c.Args().Tail()
-		if len(cmd) == 0 {
-			return xerrors.New("missing command")
-		}
-		tableName := c.String("table")
-		client, err := dialDynamoDB(tableName)
-		if err != nil {
-			return err
-		}
-		if err := createTable(client, tableName); err != nil {
-			return err
-		}
-		lock, err := grabLock(client, lockName, c.Bool("wait-for-lock"))
-		if err != nil {
-			return err
-		}
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		trap := make(chan os.Signal, 1)
-		signal.Notify(trap, os.Interrupt)
-		go func() {
-			<-trap
-			cancel()
-		}()
-		return runCommand(ctx, lock, c.Bool("release-on-error"), cmd)
-	}
+
 	if err := app.Run(os.Args); err != nil {
 		log.Fatal(err)
 	}
@@ -112,13 +127,14 @@ func grabLock(client *dynamolock.Client, lockName string, wait bool) (*dynamoloc
 	}
 }
 
-func runCommand(ctx context.Context, lock *dynamolock.Lock, releaseOnError bool, cmd []string) error {
-	command := cmd[0]
-	var parameters []string
-	if len(cmd) > 1 {
-		parameters = cmd[1:]
-	}
-	wrappedCommand := exec.CommandContext(ctx, command, parameters...)
+func runCommand(ctx context.Context, lock *dynamolock.Lock, releaseOnError bool, parameters []string) error {
+	command := "bash"
+	var params = append([]string{"-c"}, parameters...)
+	// var parameters []string
+	// if len(cmd) > 1 {
+	// 	parameters = cmd[1:]
+	// }
+	wrappedCommand := exec.CommandContext(ctx, command, params...)
 	wrappedCommand.Stdin = os.Stdin
 	wrappedCommand.Stdout = os.Stdout
 	wrappedCommand.Stderr = os.Stderr
